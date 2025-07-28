@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YC Company Analysis PDF Report Generator
-Creates a compact PDF report with 2 companies per page
+Creates a comprehensive PDF report with 1 company per page
 """
 
 import csv
@@ -14,9 +14,12 @@ from typing import Dict, List, Any, Tuple
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, KeepTogether
+from reportlab.platypus.doctemplate import PageTemplate, BaseDocTemplate
+from reportlab.platypus.frames import Frame
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.pdfgen import canvas
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -36,6 +39,74 @@ HEADERS = {
     "Content-Type": "application/json",
     "OpenAI-Beta": "assistants=v2"
 }
+
+# Prompt for summarizing criteria to 10 words
+CRITERIA_SUMMARY_PROMPT = """
+Based on the following analysis text, provide a concise evaluation in EXACTLY 10 words or less.
+DO NOT return JSON, ratings, or any structured data.
+DO NOT use ellipsis (...).
+Just return a plain text summary.
+
+Analysis text: {text}
+
+Respond with ONLY a plain text summary (maximum 10 words). No JSON, no formatting, just text.
+"""
+
+# Prompt for generating highlights
+HIGHLIGHTS_PROMPT = """
+Based on the following company analysis, identify and describe the most rare, exceptional, or outlier qualities about this company and its founders. Focus on what makes them stand out from typical YC companies.
+
+Company: {company_name}
+Score: {company_score}/5
+Analysis Data:
+- Evidence of Early PMF: {evidence_of_early_pmf}
+- Competitors: {incumbent_or_startup_alternatives_exist}
+- Founder Experience: {founders_have_ft_work_experience}
+- Top 10% Distinction: {founder_top_10_percent_distinction}
+- Founder-Product Fit: {founders_right_fit_for_product}
+- Problem Uniqueness: {problem_unique_and_specific}
+- Expansion Opportunity: {opportunity_to_expand}
+- TAM Size: {tam_size}
+
+Provide exactly 3 bullet points highlighting the most exceptional or noteworthy aspects. Focus on rare signals like:
+- Exceptional founder backgrounds (e.g., IOI medalist, Forbes 30u30)
+- Unique technical achievements
+- Unusual market insights
+- Extraordinary traction metrics
+- Distinctive competitive advantages
+
+Format your response as follows:
+• First highlight point
+• Second highlight point
+• Third highlight point
+
+DO NOT return JSON or any structured data format. Use bullet points (•) only.
+"""
+
+# Prompt for generating verdict
+VERDICT_PROMPT = """
+Based on the company analysis and score, provide a final investment verdict.
+
+Company: {company_name}
+Score: {company_score}/5
+One-line Summary: {one_line_summary}
+
+Key Analysis Points:
+- Early PMF: {evidence_of_early_pmf}
+- Founder Distinction: {founder_top_10_percent_distinction}
+- Problem Uniqueness: {problem_unique_and_specific}
+- Market Size: {tam_size}
+
+Write EXACTLY 2-4 sentences that:
+1. Justify the score given
+2. Highlight the key investment thesis (positive or negative)
+3. Note any major risks or exceptional opportunities
+4. Provide a clear recommendation
+
+IMPORTANT: Return ONLY plain text sentences. 
+DO NOT include any JSON, structured data, evaluation matrices, or formatting.
+Just write 2-4 normal sentences as the verdict.
+"""
 
 
 class VerdictGenerator:
@@ -110,30 +181,111 @@ class VerdictGenerator:
             
             raise Exception("No assistant response found")
     
+    async def summarize_criteria(self, text: str) -> str:
+        """Summarize criteria text to 10 words max"""
+        prompt = CRITERIA_SUMMARY_PROMPT.format(text=text)
+        
+        thread_id = await self.create_thread()
+        await self.add_message(thread_id, prompt)
+        summary = await self.run_assistant(thread_id)
+        
+        # Clean up any JSON response
+        summary = summary.strip()
+        if summary.startswith('{') or summary.startswith('['):
+            # If JSON was returned, extract first meaningful text
+            try:
+                import re
+                # Find first quoted string that's not a key
+                match = re.search(r'"[^"]+"\s*:\s*"([^"]+)"', summary)
+                if match:
+                    summary = match.group(1)
+                else:
+                    summary = "Evaluation pending"
+            except:
+                summary = "Evaluation pending"
+        
+        # Ensure max 10 words
+        words = summary.split()
+        if len(words) > 10:
+            summary = ' '.join(words[:10])
+        
+        return summary
+    
+    async def generate_highlights(self, company_data: Dict[str, Any]) -> str:
+        """Generate highlights about rare/exceptional qualities"""
+        prompt = HIGHLIGHTS_PROMPT.format(
+            company_name=company_data.get('company_name', 'Unknown'),
+            company_score=company_data.get('company_score', '3'),
+            evidence_of_early_pmf=company_data.get('evidence_of_early_pmf', 'N/A'),
+            incumbent_or_startup_alternatives_exist=company_data.get('incumbent_or_startup_alternatives_exist', 'N/A'),
+            founders_have_ft_work_experience=company_data.get('founders_have_ft_work_experience', 'N/A'),
+            founder_top_10_percent_distinction=company_data.get('founder_top_10_percent_distinction', 'N/A'),
+            founders_right_fit_for_product=company_data.get('founders_right_fit_for_product', 'N/A'),
+            problem_unique_and_specific=company_data.get('problem_unique_and_specific', 'N/A'),
+            opportunity_to_expand=company_data.get('opportunity_to_expand', 'N/A'),
+            tam_size=company_data.get('tam_size', 'N/A')
+        )
+        
+        thread_id = await self.create_thread()
+        await self.add_message(thread_id, prompt)
+        highlights = await self.run_assistant(thread_id)
+        
+        # Clean up any JSON response
+        highlights = highlights.strip()
+        if highlights.startswith('{') or highlights.startswith('['):
+            # If JSON was returned, try to extract meaningful text
+            try:
+                import re
+                # Look for any text after colons that's not a key
+                matches = re.findall(r':\s*"([^"]+)"', highlights)
+                if matches:
+                    # Join the first few meaningful strings
+                    highlights = ' '.join(matches[:3])
+                else:
+                    highlights = "This company shows strong potential based on the founder backgrounds and market opportunity."
+            except:
+                highlights = "This company shows strong potential based on the founder backgrounds and market opportunity."
+        
+        return highlights
+    
     async def generate_verdict(self, company_data: Dict[str, Any]) -> str:
         """Generate a verdict for a company based on its analysis"""
-        prompt = f"""
-Based on the following YC company analysis, provide a concise 1-2 sentence overall verdict that synthesizes all the key findings. Focus on investment potential and key strengths/weaknesses.
-
-Company: {company_data.get('company_name', 'Unknown')}
-
-Analysis:
-- Early PMF: {company_data.get('evidence_of_early_pmf', 'N/A')}
-- Competitors: {company_data.get('incumbent_or_startup_alternatives_exist', 'N/A')}
-- Founder Experience: {company_data.get('founders_have_ft_work_experience', 'N/A')}
-- Top 10% Distinction: {company_data.get('founder_top_10_percent_distinction', 'N/A')}
-- Founder-Product Fit: {company_data.get('founders_right_fit_for_product', 'N/A')}
-- Problem Uniqueness: {company_data.get('problem_unique_and_specific', 'N/A')}
-- Expansion Opportunity: {company_data.get('opportunity_to_expand', 'N/A')}
-- TAM: {company_data.get('tam_size', 'N/A')}
-
-Provide ONLY the 1-2 sentence verdict. No additional text or explanation.
-"""
+        prompt = VERDICT_PROMPT.format(
+            company_name=company_data.get('company_name', 'Unknown'),
+            company_score=company_data.get('company_score', '3'),
+            one_line_summary=company_data.get('one_line_summary', 'N/A'),
+            evidence_of_early_pmf=company_data.get('evidence_of_early_pmf', 'N/A'),
+            founder_top_10_percent_distinction=company_data.get('founder_top_10_percent_distinction', 'N/A'),
+            problem_unique_and_specific=company_data.get('problem_unique_and_specific', 'N/A'),
+            tam_size=company_data.get('tam_size', 'N/A')
+        )
         
         thread_id = await self.create_thread()
         await self.add_message(thread_id, prompt)
         verdict = await self.run_assistant(thread_id)
-        return verdict.strip()
+        
+        # Clean up verdict - remove any JSON that might appear
+        verdict = verdict.strip()
+        
+        # If there's JSON at the end, cut it off
+        json_start = verdict.find('{')
+        if json_start > 0:  # Found JSON after some text
+            verdict = verdict[:json_start].strip()
+        
+        # Also check for evaluation matrix pattern
+        if 'EvaluationMatrix' in verdict or 'evaluationMatrix' in verdict:
+            # Find where the JSON starts and cut it off
+            for marker in ['{', '"EvaluationMatrix"', '"evaluationMatrix"']:
+                pos = verdict.find(marker)
+                if pos > 0:
+                    verdict = verdict[:pos].strip()
+                    break
+        
+        # Ensure we have at least some verdict
+        if not verdict or len(verdict) < 20:
+            verdict = f"With a score of {company_data.get('company_score', '3')}/5, this company shows potential but requires careful evaluation. The founding team and market opportunity are notable, though execution risks remain."
+        
+        return verdict
 
 
 class PDFReportGenerator:
@@ -185,30 +337,10 @@ class PDFReportGenerator:
             spaceBefore=8
         )
     
-    def extract_company_description(self, launch_content: str) -> str:
-        """Extract a brief description from launch post content"""
-        if not launch_content:
-            return "No description available."
-        
-        # Take first 2-3 sentences or ~200 characters
-        sentences = launch_content.split('.')[:3]
-        description = '. '.join(sentences).strip()
-        
-        # Clean up common patterns
-        description = description.replace('\n', ' ')
-        description = ' '.join(description.split())  # Remove extra spaces
-        
-        # Limit length
-        if len(description) > 250:
-            description = description[:247] + "..."
-        elif not description.endswith('.'):
-            description += '.'
-            
-        return description
     
-    def create_analysis_table(self, company_data: Dict[str, Any]) -> Table:
-        """Create a compact analysis summary table"""
-        # Define criteria and extract data
+    async def create_analysis_table(self, company_data: Dict[str, Any], summaries: Dict[str, str]) -> Table:
+        """Create analysis summary table with summarized criteria"""
+        # Define criteria and extract data (excluding "Based in SF")
         criteria_mapping = [
             ("Early PMF", "evidence_of_early_pmf"),
             ("Competitors", "incumbent_or_startup_alternatives_exist"),
@@ -217,8 +349,7 @@ class PDFReportGenerator:
             ("Right Fit", "founders_right_fit_for_product"),
             ("Unique Problem", "problem_unique_and_specific"),
             ("Expansion", "opportunity_to_expand"),
-            ("Large TAM", "tam_size"),
-            ("Based in SF", "founders_based_in_sf")
+            ("Large TAM", "tam_size")
         ]
         
         # Create table data
@@ -227,39 +358,28 @@ class PDFReportGenerator:
         for label, key in criteria_mapping:
             value = company_data.get(key, "N/A")
             
-            # Determine checkmark or X based on content
-            if isinstance(value, str):
-                value_lower = value.lower()
-                if any(word in value_lower for word in ["yes", "strong", "excellent", "significant", "substantial", "large"]):
-                    symbol = "✓"
-                    color = colors.green
-                elif any(word in value_lower for word in ["no", "error", "failed", "none", "limited"]):
-                    symbol = "✗"
-                    color = colors.red
-                else:
-                    symbol = "~"
-                    color = colors.orange
-            else:
-                symbol = "?"
-                color = colors.grey
-            
-            # Create brief summary (max 6-7 words)
+            # Get pre-computed summary
             if value and value != "N/A":
-                words = value.split()[:6]
-                brief_summary = ' '.join(words)
-                if len(words) < len(value.split()):
-                    brief_summary += "..."
+                summary = summaries.get(f"{company_data['company_name']}_{key}", "No summary available")
+                # Ensure it's wrapped in a Paragraph for proper text wrapping
+                summary_para = Paragraph(summary, ParagraphStyle(
+                    'TableCell',
+                    parent=self.styles['Normal'],
+                    fontSize=9,
+                    leading=11
+                ))
             else:
-                brief_summary = "No data"
+                summary_para = Paragraph("No data available", ParagraphStyle(
+                    'TableCell',
+                    parent=self.styles['Normal'],
+                    fontSize=9,
+                    leading=11
+                ))
             
-            # Add colored symbol
-            table_data.append([
-                label,
-                f"{symbol} {brief_summary}"
-            ])
+            table_data.append([label, summary_para])
         
         # Create table
-        col_widths = [2.5*inch, 3.5*inch]
+        col_widths = [2*inch, 4.5*inch]
         table = Table(table_data, colWidths=col_widths)
         
         # Apply table style
@@ -283,20 +403,21 @@ class PDFReportGenerator:
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#fafafa')]),
             
             # Padding
-            ('LEFTPADDING', (0, 0), (-1, -1), 6),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-            ('TOPPADDING', (0, 0), (-1, -1), 3),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ]))
         
         return table
     
-    def create_company_section(self, company_data: Dict[str, Any], description: str, verdict: str) -> List:
+    async def create_company_section(self, company_data: Dict[str, Any], summaries: Dict[str, str], highlights: str, verdict: str) -> List:
         """Create a complete company section"""
         elements = []
         
         # Company name
-        elements.append(Paragraph(company_data.get('company_name', 'Unknown Company'), self.company_name_style))
+        company_name = company_data.get('company_name', 'Unknown Company')
+        elements.append(Paragraph(company_name, self.company_name_style))
         
         # Horizontal line
         elements.append(Spacer(1, 2))
@@ -304,17 +425,51 @@ class PDFReportGenerator:
                             style=TableStyle([('LINEABOVE', (0, 0), (-1, 0), 1, colors.HexColor('#cccccc'))])))
         elements.append(Spacer(1, 8))
         
-        # Overview section
-        elements.append(Paragraph("<b>Overview</b>", self.section_header_style))
-        elements.append(Paragraph(description, self.overview_style))
+        # One-line summary
+        one_line_summary = company_data.get('one_line_summary', 'No summary available')
+        elements.append(Paragraph(one_line_summary, self.overview_style))
+        elements.append(Spacer(1, 12))
         
-        # Analysis table
-        elements.append(Paragraph("<b>Analysis Summary</b>", self.section_header_style))
-        elements.append(self.create_analysis_table(company_data))
+        # Criteria Table
+        elements.append(Paragraph("<b>Criteria Table</b>", self.section_header_style))
+        table = await self.create_analysis_table(company_data, summaries)
+        elements.append(table)
+        elements.append(Spacer(1, 12))
         
-        # Verdict
-        elements.append(Spacer(1, 8))
-        elements.append(Paragraph("<b>Verdict:</b> " + verdict, self.verdict_style))
+        # Highlights
+        elements.append(Paragraph("<b>Highlights</b>", self.section_header_style))
+        
+        # Create bullet point style
+        bullet_style = ParagraphStyle(
+            'BulletPoint',
+            parent=self.overview_style,
+            leftIndent=20,
+            bulletIndent=10
+        )
+        
+        # Split highlights into bullet points
+        bullet_points = []
+        if '•' in highlights:
+            # If already has bullet points, split by them
+            points = highlights.split('•')
+            for point in points:
+                point = point.strip()
+                if point:
+                    bullet_points.append(point)
+        else:
+            # Fallback: treat as single paragraph
+            bullet_points = [highlights]
+        
+        # Add each bullet point
+        for point in bullet_points:
+            elements.append(Paragraph(f"• {point}", bullet_style))
+        
+        elements.append(Spacer(1, 12))
+        
+        # Verdict with Score
+        score = company_data.get('company_score', '3')
+        elements.append(Paragraph(f"<b>Verdict: Score {score}/5</b>", self.section_header_style))
+        elements.append(Paragraph(verdict, self.overview_style))
         
         return elements
     
@@ -332,121 +487,173 @@ class PDFReportGenerator:
         
         print(f"Generating PDF report for {len(companies)} companies...")
         
-        # Generate verdicts for all companies
-        verdicts = {}
+        # Initialize generator
         async with aiohttp.ClientSession() as session:
             generator = VerdictGenerator(session)
+        
+            # Page counter to skip footer on first page
+            page_counter = {'page': 0}
             
-            print("Generating verdicts...")
+            def add_footer(canvas, doc):
+                """Add footer to pages (except first page)"""
+                page_counter['page'] += 1
+                if page_counter['page'] > 1:  # Skip footer on first page
+                    canvas.saveState()
+                    
+                    # Draw horizontal line
+                    canvas.setStrokeColor(colors.HexColor('#cccccc'))
+                    canvas.setLineWidth(0.5)
+                    canvas.line(0.5*inch, 0.75*inch, letter[0] - 0.5*inch, 0.75*inch)
+                    
+                    # Footer text
+                    canvas.setFont('Helvetica', 9)
+                    canvas.setFillColor(colors.HexColor('#666666'))
+                    
+                    # Left side - report title
+                    canvas.drawString(0.75*inch, 0.5*inch, "S25 developer, fintech, and legal tech companies analysis")
+                    
+                    # Right side - author
+                    canvas.drawRightString(letter[0] - 0.75*inch, 0.5*inch, "by Shourya Lala")
+                    
+                    canvas.restoreState()
+            
+            # Create PDF document
+            doc = SimpleDocTemplate(
+                output_file,
+                pagesize=letter,
+                rightMargin=0.5*inch,
+                leftMargin=0.5*inch,
+                topMargin=0.5*inch,
+                bottomMargin=1*inch  # Increased to make room for footer
+            )
+            
+            # Build content
+            story = []
+            
+            # Title page
+            title_style = ParagraphStyle(
+                'Title',
+                parent=self.styles['Title'],
+                fontSize=24,
+                textColor=colors.HexColor('#1a1a1a'),
+                alignment=TA_CENTER,
+                spaceAfter=20
+            )
+            
+            subtitle_style = ParagraphStyle(
+                'Subtitle',
+                parent=self.styles['Normal'],
+                fontSize=14,
+                textColor=colors.HexColor('#333333'),
+                alignment=TA_CENTER,
+                spaceAfter=10
+            )
+            
+            story.append(Spacer(1, 2*inch))
+            story.append(Paragraph("S25 developer, fintech, and legal tech companies analysis", title_style))
+            story.append(Paragraph("by Shourya Lala", subtitle_style))
+            story.append(Spacer(1, 0.5*inch))
+            story.append(Paragraph(f"Created: {datetime.now().strftime('%B %d, %Y')}", self.styles['Normal']))
+            story.append(Paragraph(f"Total Companies: {len(companies)}", self.styles['Normal']))
+            story.append(PageBreak())
+            
+            # Step 1: Prepare all LLM tasks for parallel processing
+            print("\nStep 1: Preparing LLM tasks for all companies...")
+            criteria_tasks = []
+            highlights_tasks = []
+            verdict_tasks = []
+            
+            criteria_mapping = [
+                ("evidence_of_early_pmf"),
+                ("incumbent_or_startup_alternatives_exist"),
+                ("founders_have_ft_work_experience"),
+                ("founder_top_10_percent_distinction"),
+                ("founders_right_fit_for_product"),
+                ("problem_unique_and_specific"),
+                ("opportunity_to_expand"),
+                ("tam_size")
+            ]
+            
+            for company in companies:
+                company_name = company.get('company_name', 'Unknown')
+                
+                # Create tasks for criteria summaries
+                for key in criteria_mapping:
+                    value = company.get(key, "N/A")
+                    if value and value != "N/A":
+                        task_key = f"{company_name}_{key}"
+                        criteria_tasks.append((task_key, generator.summarize_criteria(value)))
+                
+                # Create task for highlights
+                highlights_tasks.append((company_name, generator.generate_highlights(company)))
+                
+                # Create task for verdict
+                verdict_tasks.append((company_name, generator.generate_verdict(company)))
+            
+            # Step 2: Run all LLM tasks in parallel
+            print(f"\nStep 2: Running {len(criteria_tasks) + len(highlights_tasks) + len(verdict_tasks)} LLM calls in parallel...")
+            
+            # Process criteria summaries
+            summaries = {}
+            if criteria_tasks:
+                print(f"  - Processing {len(criteria_tasks)} criteria summaries...")
+                criteria_results = await asyncio.gather(*[task for _, task in criteria_tasks], return_exceptions=True)
+                for i, (key, _) in enumerate(criteria_tasks):
+                    if not isinstance(criteria_results[i], Exception):
+                        summaries[key] = criteria_results[i]
+                    else:
+                        summaries[key] = "Error generating summary"
+            
+            # Process highlights
+            highlights_dict = {}
+            if highlights_tasks:
+                print(f"  - Processing {len(highlights_tasks)} highlights...")
+                highlights_results = await asyncio.gather(*[task for _, task in highlights_tasks], return_exceptions=True)
+                for i, (company_name, _) in enumerate(highlights_tasks):
+                    if not isinstance(highlights_results[i], Exception):
+                        highlights_dict[company_name] = highlights_results[i]
+                    else:
+                        highlights_dict[company_name] = "Error generating highlights"
+            
+            # Process verdicts
+            verdict_dict = {}
+            if verdict_tasks:
+                print(f"  - Processing {len(verdict_tasks)} verdicts...")
+                verdict_results = await asyncio.gather(*[task for _, task in verdict_tasks], return_exceptions=True)
+                for i, (company_name, _) in enumerate(verdict_tasks):
+                    if not isinstance(verdict_results[i], Exception):
+                        verdict_dict[company_name] = verdict_results[i]
+                    else:
+                        verdict_dict[company_name] = "Error generating verdict"
+            
+            # Step 3: Generate PDF pages with pre-computed results
+            print("\nStep 3: Generating PDF pages...")
             for i, company in enumerate(companies):
                 company_name = company.get('company_name', 'Unknown')
-                print(f"  {i+1}/{len(companies)}: {company_name}")
+                print(f"  - Creating page for {company_name}...")
                 
-                try:
-                    verdict = await generator.generate_verdict(company)
-                    verdicts[company_name] = verdict
-                except Exception as e:
-                    print(f"    Error generating verdict: {e}")
-                    verdicts[company_name] = "Unable to generate verdict due to processing error."
-        
-        # Create PDF
-        doc = SimpleDocTemplate(
-            output_file,
-            pagesize=letter,
-            rightMargin=0.5*inch,
-            leftMargin=0.5*inch,
-            topMargin=0.5*inch,
-            bottomMargin=0.5*inch
-        )
-        
-        # Build content
-        story = []
-        
-        # Title page
-        title_style = ParagraphStyle(
-            'Title',
-            parent=self.styles['Title'],
-            fontSize=24,
-            textColor=colors.HexColor('#1a1a1a'),
-            alignment=TA_CENTER,
-            spaceAfter=20
-        )
-        
-        story.append(Spacer(1, 2*inch))
-        story.append(Paragraph("YC Company Analysis Report", title_style))
-        story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y')}", self.styles['Normal']))
-        story.append(Paragraph(f"Total Companies: {len(companies)}", self.styles['Normal']))
-        story.append(PageBreak())
-        
-        # Process companies in pairs
-        for i in range(0, len(companies), 2):
-            # First company
-            company1 = companies[i]
-            company1_name = company1.get('company_name', 'Unknown')
-            
-            # Extract description from launch_post_content if available
-            launch_content = ""
-            # Try to find the company in the input file to get launch_post_content
-            try:
-                with open('company_input.json', 'r', encoding='utf-8') as f:
-                    input_data = json.load(f)
-                    for comp in input_data:
-                        if comp.get('company_name') == company1_name:
-                            launch_content = comp.get('launch_post_content', '')
-                            break
-            except:
-                pass
-            
-            description1 = self.extract_company_description(launch_content) if launch_content else \
-                          f"{company1_name} is a YC company focused on innovative solutions."
-            verdict1 = verdicts.get(company1_name, "Analysis pending.")
-            
-            # Create first company section
-            company1_elements = self.create_company_section(company1, description1, verdict1)
-            
-            # Keep first company together
-            story.append(KeepTogether(company1_elements))
-            
-            # Add separator between companies on same page
-            if i + 1 < len(companies):
-                story.append(Spacer(1, 0.3*inch))
-                story.append(Table([['']], colWidths=[7*inch], rowHeights=[2],
-                                 style=TableStyle([('LINEABOVE', (0, 0), (-1, 0), 2, colors.HexColor('#666666'))])))
-                story.append(Spacer(1, 0.3*inch))
+                # Get pre-computed results
+                company_highlights = highlights_dict.get(company_name, "No highlights available")
+                company_verdict = verdict_dict.get(company_name, "No verdict available")
                 
-                # Second company
-                company2 = companies[i + 1]
-                company2_name = company2.get('company_name', 'Unknown')
+                # Create company section with pre-computed results
+                company_elements = await self.create_company_section(
+                    company, 
+                    summaries, 
+                    company_highlights, 
+                    company_verdict
+                )
                 
-                # Extract description
-                launch_content2 = ""
-                try:
-                    with open('company_input.json', 'r', encoding='utf-8') as f:
-                        input_data = json.load(f)
-                        for comp in input_data:
-                            if comp.get('company_name') == company2_name:
-                                launch_content2 = comp.get('launch_post_content', '')
-                                break
-                except:
-                    pass
+                # Add to story
+                story.extend(company_elements)
                 
-                description2 = self.extract_company_description(launch_content2) if launch_content2 else \
-                              f"{company2_name} is a YC company focused on innovative solutions."
-                verdict2 = verdicts.get(company2_name, "Analysis pending.")
-                
-                # Create second company section
-                company2_elements = self.create_company_section(company2, description2, verdict2)
-                
-                # Keep second company together
-                story.append(KeepTogether(company2_elements))
+                # Page break after each company (except last)
+                if i < len(companies) - 1:
+                    story.append(PageBreak())
             
-            # Page break after each pair
-            if i + 2 < len(companies):
-                story.append(PageBreak())
-        
-        # Build PDF
-        doc.build(story)
-        print(f"\nPDF report generated successfully: {output_file}")
+            # Build PDF with footer on each page
+            doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
+            print(f"\nPDF report generated successfully: {output_file}")
 
 
 async def main():
